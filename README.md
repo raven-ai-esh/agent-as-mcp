@@ -278,6 +278,151 @@ result = await app.ainvoke({"current_message": "Order pizza"})
 | `create_skill_router()` | Router for conditional edges in LangGraph |
 | `SkillGraphState` | TypedDict state schema for LangGraph |
 
+## MCP Server
+
+Run raven-skills as an MCP server for use with Claude, Cursor, and other MCP clients.
+
+### Installation
+
+```bash
+pip install raven-skills[mcp]
+```
+
+### Quick Start
+
+```bash
+# Default server with OpenAI
+python -m raven_skills serve
+
+# With Ollama
+python -m raven_skills serve --base-url http://localhost:11434/v1 --model llama3
+```
+
+### All CLI Options
+
+```bash
+python -m raven_skills serve [APP] [OPTIONS]
+
+# APP (optional): Custom app module:variable (e.g., my_app:mcp)
+
+Options:
+  --port PORT              HTTP port (default: 8000)
+  --transport {http,stdio} Transport type (default: http)
+  --storage PATH           Skills JSON file (default: ./skills.json)
+  --model MODEL            LLM model (default: gpt-4o-mini)
+  --embedding-model MODEL  Embedding model (default: text-embedding-3-small)
+  --base-url URL           OpenAI-compatible API URL
+  --api-key KEY            API key (overrides OPENAI_API_KEY)
+  --embedding-base-url URL Separate URL for embeddings
+```
+
+### Custom App (FastAPI-style)
+
+Create your fully configured server in Python, run with CLI:
+
+```python
+# my_server.py
+from openai import AsyncOpenAI
+from mcp.server.fastmcp import FastMCP
+from raven_skills import SkillDialogueAgent, Tool, JSONStorage
+
+# 1. Configure your tools
+def get_weather(city: str) -> str:
+    return f"Weather in {city}: sunny, 22°C"
+
+def search_restaurants(location: str, cuisine: str = "any") -> str:
+    return f"Found 5 {cuisine} restaurants near {location}"
+
+tools = [
+    Tool(
+        name="get_weather",
+        description="Get current weather",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+        function=get_weather,
+    ),
+    Tool(
+        name="search_restaurants",
+        description="Find restaurants",
+        parameters={"type": "object", "properties": {
+            "location": {"type": "string"},
+            "cuisine": {"type": "string"},
+        }},
+        function=search_restaurants,
+    ),
+]
+
+# 2. Configure client and storage
+client = AsyncOpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+storage = JSONStorage("./my-skills.json")
+
+# 3. Create agent with everything configured
+agent = SkillDialogueAgent(
+    client=client,
+    storage=storage,
+    tools=tools,
+    llm_model="llama3",
+    embedding_model="bge-m3:latest",
+    auto_generate_skills=True,
+)
+
+# 4. Create MCP server and expose agent
+mcp = FastMCP(name="my-skills-server")
+
+@mcp.tool()
+async def chat(message: str) -> str:
+    """Chat with the skill agent."""
+    response = await agent.chat(message)
+    return response.message
+
+@mcp.tool()
+async def list_skills() -> list[dict]:
+    """List all learned skills."""
+    skills = await storage.get_all()
+    return [{"name": s.name, "description": s.metadata.description} for s in skills]
+
+@mcp.tool()
+async def reset_conversation() -> str:
+    """Reset the conversation state."""
+    agent.reset()
+    return "Conversation reset"
+```
+
+Run it:
+```bash
+python -m raven_skills serve my_server:mcp --port 9000
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `execute_skill` | Execute a skill for a query (auto-matches or uses specific skill) |
+| `list_skills` | List all available skills |
+| `create_skill` | Create a new skill manually |
+| `search_skills` | Search skills by semantic similarity |
+
+### Available Resources
+
+| Resource | URI | Description |
+|----------|-----|-------------|
+| Skills Library | `skills://library` | JSON array of all skills |
+| Skill Detail | `skills://skill/{id}` | Single skill details |
+
+### Claude Desktop Integration
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "raven-skills": {
+      "command": "python",
+      "args": ["-m", "raven_skills", "serve", "--transport", "stdio"]
+    }
+  }
+}
+```
+
 ## License
 
 Apache 2.0
