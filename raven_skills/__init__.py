@@ -47,6 +47,20 @@ from raven_skills.utils.similarity import (
     euclidean_distance,
 )
 
+# Integrations (optional - only if langchain is installed)
+try:
+    from raven_skills.integrations import (
+        SkillMatcherTool,
+        SkillDialogueTool,
+        SkillAgentRunnable,
+        create_skill_node,
+        create_skill_router,
+        SkillGraphState,
+    )
+    _HAS_INTEGRATIONS = True
+except ImportError:
+    _HAS_INTEGRATIONS = False
+
 __all__ = [
     # Version
     "__version__",
@@ -72,3 +86,14 @@ __all__ = [
     "normalize_embedding",
     "euclidean_distance",
 ]
+
+# Add integrations to __all__ if available
+if _HAS_INTEGRATIONS:
+    __all__.extend([
+        "SkillMatcherTool",
+        "SkillDialogueTool",
+        "SkillAgentRunnable",
+        "create_skill_node",
+        "create_skill_router",
+        "SkillGraphState",
+    ])

@@ -74,7 +74,7 @@ class LLMClient:
         for name, field in schema.model_fields.items():
             desc = field.description or ""
             fields.append(f'  "{name}": "{desc}"')
-        return "Ответь строго в JSON формате:\n{\n" + ",\n".join(fields) + "\n}"
+        return "Respond strictly in JSON format:\n{\n" + ",\n".join(fields) + "\n}"
     
     async def _parse(
         self,
@@ -111,7 +111,7 @@ class LLMClient:
         
         Local LLMs sometimes return:
         - Lists as comma-separated strings
-        - Booleans as "Да"/"Нет" or "true"/"false" strings
+        - Booleans as "Yes"/"No" or "true"/"false" strings
         This normalizes them to proper Python types.
         """
         # Normalize list fields
@@ -217,8 +217,8 @@ class LLMClient:
                 skill_goal=skill.metadata.goal,
                 skill_steps=steps_text,
                 task_query=task.query,
-                execution_output=result.output or "Нет вывода",
-                execution_error=result.error or "Нет ошибки",
+                execution_output=result.output or "No output",
+                execution_error=result.error or "No error",
                 user_feedback=user_feedback,
             ),
             response_schema=FailureDiagnosis,
@@ -265,11 +265,11 @@ class LLMClient:
                 f"  {j+1}. {step.instruction}"
                 for j, step in enumerate(skill.steps)
             )
-            descriptions.append(f"""## Навык {i}: {skill.name}
-Описание: {skill.metadata.description}
-Цель: {skill.metadata.goal}
-Ключевые слова: {", ".join(skill.metadata.keywords)}
-Шаги:
+            descriptions.append(f"""## Skill {i}: {skill.name}
+Description: {skill.metadata.description}
+Goal: {skill.metadata.goal}
+Keywords: {", ".join(skill.metadata.keywords)}
+Steps:
 {steps_text}""")
         
         return await self._parse(
@@ -294,7 +294,7 @@ class LLMClient:
             system_prompt=EXECUTE_STEP_SYSTEM,
             user_prompt=EXECUTE_STEP_USER.format(
                 step_instruction=step.instruction,
-                expected_output=step.expected_output or "Не указан",
+                expected_output=step.expected_output or "Not specified",
                 context=json.dumps(context, ensure_ascii=False, default=str),
             ),
             response_schema=StepExecutionResult,

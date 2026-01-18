@@ -271,8 +271,12 @@ class SkillDialogueAgent:
     def _step_needs_clarification(self, instruction: str) -> bool:
         """Check if step instruction indicates need for user input."""
         clarification_markers = [
+            # English markers
+            "ask", "clarify", "request", "confirm", "inquire",
+            "which", "what", "when", "where", "how many",
+            "do you want", "would you like", "do you need",
+            # Russian markers (for backward compatibility)
             "уточни", "спроси", "узнай", "запроси",
-            "ask", "clarify", "request", "confirm",
             "какой", "какая", "какое", "на какую",
             "нужно ли", "требуется ли", "хотите ли",
         ]
