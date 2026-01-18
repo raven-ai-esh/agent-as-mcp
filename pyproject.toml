@@ -1,12 +1,18 @@
 [project]
 name = "raven-skills"
-version = "0.1.0"
+version = "0.3.0"
 description = "Skill-based agent library for adaptive AI systems"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["openai>=1.0.0", "pydantic>=2.0.0"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "mypy", "ruff"]
+mcp = ["mcp>=1.0.0"]
+langchain = ["langchain-core>=0.2.0", "langgraph>=0.1.0"]
+all = ["mcp>=1.0.0", "langchain-core>=0.2.0", "langgraph>=0.1.0"]
+
+[project.scripts]
+raven-skills = "raven_skills.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
