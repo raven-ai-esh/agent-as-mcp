@@ -236,3 +236,9 @@ htmlcov/
 # Local development
 .env.local
 .env.*.local
+
+# Build artifacts
+dist/
+build/
+*.whl
+*.egg-info/

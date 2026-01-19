@@ -56,9 +56,12 @@ class DialogueResponse:
     message: str
     skill_used: Skill | None = None
     skill_generated: bool = False
+    skill_refined: bool = False  # True if skill was refined after feedback
     needs_user_input: bool = False  # True when waiting for clarification
+    can_retry: bool = False  # True if retry with feedback is possible
     tools_called: list[ToolCall] = field(default_factory=list)
     conversation_id: str = field(default_factory=lambda: str(uuid4()))
+    execution_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 @dataclass

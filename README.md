@@ -208,6 +208,27 @@ response = await agent.chat("Moscow")
 # The "weather" skill is now saved and will be reused
 ```
 
+### Feedback & Error Correction
+
+When the agent makes a mistake, provide feedback:
+
+```python
+# Automatic detection: just tell what's wrong
+response = await agent.chat("No, you missed the second sheet")
+# Agent detects negative feedback → refines skill → retries
+
+# Or use explicit API
+response = await agent.feedback("negative", "You missed the second sheet")
+# → Agent diagnoses error, refines skill, and retries
+
+# Save improved skill after successful retry
+if response.skill_refined:
+    await agent.save_refined_skill()
+
+# Positive feedback
+await agent.feedback("positive")
+```
+
 ## LangChain / LangGraph Integration
 
 The library is fully compatible with the LangChain ecosystem.
