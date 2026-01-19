@@ -100,6 +100,12 @@ class SkillDialogueAgent:
         self._pending_task: Task | None = None
         self._collected_inputs: dict[str, Any] = {}
         
+        # Execution tracking (for feedback)
+        self._last_skill: Skill | None = None
+        self._last_task: Task | None = None
+        self._last_step_outputs: list[str] = []
+        self._last_tools_called: list = []
+        
         # Tool lookup
         self._tool_map = {tool.name: tool for tool in self.tools}
     
@@ -125,6 +131,11 @@ class SkillDialogueAgent:
         self._pending_step_index = 0
         self._pending_task = None
         self._collected_inputs = {}
+        # Clear execution tracking
+        self._last_skill = None
+        self._last_task = None
+        self._last_step_outputs = []
+        self._last_tools_called = []
     
     async def chat(
         self,
@@ -153,6 +164,10 @@ class SkillDialogueAgent:
         # If we have a pending skill awaiting user input, continue execution
         if self._pending_skill:
             return await self._continue_skill_execution(message)
+        
+        # Check if this is negative feedback on last execution
+        if self._last_skill and await self._detect_negative_feedback(message):
+            return await self._retry_with_feedback(message)
         
         # Prepare task for matching
         task = await self._prepare_task(message)
@@ -260,12 +275,19 @@ class SkillDialogueAgent:
         self._conversation.current_skill = skill
         self._collected_inputs = {}
         
+        # Save execution state for potential feedback
+        self._last_skill = skill
+        self._last_task = task
+        self._last_step_outputs = [context.get(f"step_{s.order}_result", "") for s in sorted_steps]
+        self._last_tools_called = tools_called
+        
         return DialogueResponse(
             message=final_response,
             skill_used=skill,
             skill_generated=skill_generated,
             tools_called=tools_called,
             conversation_id=self._conversation.id,
+            can_retry=True,  # Allow retry with feedback
         )
     
     def _step_needs_clarification(self, instruction: str) -> bool:
@@ -293,6 +315,171 @@ class SkillDialogueAgent:
             ],
         )
         return response.choices[0].message.content
+    
+    # ─────────────────────────────────────────────────────────────
+    # Feedback Mechanism
+    # ─────────────────────────────────────────────────────────────
+    
+    async def _detect_negative_feedback(self, message: str) -> bool:
+        """Detect if message is negative feedback on last execution."""
+        negative_patterns = [
+            # English
+            "no", "wrong", "incorrect", "not right", "mistake", "error",
+            "missing", "forgot", "didn't", "failed", "broken", "bad",
+            "that's not", "you missed", "you forgot", "try again",
+            # Russian
+            "нет", "неправильно", "не так", "ошибка", "пропустил",
+            "забыл", "не то", "плохо", "неверно",
+        ]
+        message_lower = message.lower()
+        return any(pattern in message_lower for pattern in negative_patterns)
+    
+    async def _retry_with_feedback(self, correction: str) -> DialogueResponse:
+        """Retry last execution with user's correction."""
+        from raven_skills.models.result import ExecutionResult
+        
+        # Create a mock execution result for diagnosis
+        last_output = "\n".join(str(s) for s in self._last_step_outputs) if self._last_step_outputs else "No output"
+        mock_result = ExecutionResult(
+            success=False,  # It failed, that's why we're retrying
+            output=last_output,
+        )
+        
+        # Diagnose what went wrong
+        try:
+            diagnosis = await self._llm.diagnose_failure(
+                self._last_skill,
+                self._last_task,
+                mock_result,
+                correction,
+            )
+            
+            # Map root_cause to RefinementType
+            from raven_skills.models.result import RefinementAction, RefinementType
+            
+            root_cause_map = {
+                "wrong_steps": RefinementType.EDIT_SKILL,
+                "wrong_selection": RefinementType.EDIT_MATCHING,
+                "wrong_expectations": RefinementType.FORK_SKILL,
+            }
+            refinement_type = root_cause_map.get(diagnosis.root_cause, RefinementType.EDIT_SKILL)
+            
+            action = RefinementAction(
+                type=refinement_type,
+                skill_id=self._last_skill.id,
+                diagnosis=diagnosis.diagnosis,
+                suggested_changes=diagnosis.suggested_changes,
+            )
+            
+            # Refine the skill
+            refined = await self._llm.refine_skill(
+                self._last_skill,
+                action,
+            )
+            
+            # Build refined skill
+            from raven_skills.models.skill import SkillMetadata, SkillStep
+            
+            refined_skill = Skill(
+                id=f"{self._last_skill.id}-v{self._last_skill.version + 1}",
+                name=refined.name,
+                version=self._last_skill.version + 1,
+                parent_id=self._last_skill.id,
+                metadata=SkillMetadata(
+                    description=refined.description,
+                    goal=refined.goal,
+                    keywords=refined.keywords,
+                    embedding=self._last_skill.metadata.embedding,
+                ),
+                steps=[
+                    SkillStep(order=i + 1, instruction=step)
+                    for i, step in enumerate(refined.steps)
+                ],
+            )
+            
+            # Execute refined skill
+            result = await self._execute_skill_stepwise(
+                refined_skill, self._last_task, skill_generated=False
+            )
+            
+            # Mark as refined and ask to save
+            result.skill_refined = True
+            result.message += "\n\n💡 Skill was refined. Save updated version? (yes/no)"
+            
+            # Store refined skill for potential save
+            self._refined_skill_pending = refined_skill
+            
+            return result
+            
+        except Exception as e:
+            # Log the error for debugging
+            import traceback
+            print(f"[FEEDBACK DEBUG] Refinement failed: {e}")
+            traceback.print_exc()
+            
+            # If refinement fails, just acknowledge and retry with original approach
+            self._conversation.add_message(
+                "assistant", 
+                f"I understand. Let me try again with your feedback: {correction}"
+            )
+            return await self._execute_skill_stepwise(
+                self._last_skill, self._last_task, skill_generated=False
+            )
+    
+    async def feedback(
+        self,
+        rating: str,  # "positive" or "negative"
+        correction: str | None = None,
+    ) -> DialogueResponse:
+        """Provide explicit feedback on last execution.
+        
+        Args:
+            rating: "positive" or "negative"
+            correction: What was wrong (required for negative feedback)
+        
+        Returns:
+            DialogueResponse with retry result or acknowledgment
+        
+        Example:
+            # When execution was wrong
+            await agent.feedback("negative", "You missed the second sheet")
+            
+            # When execution was correct
+            await agent.feedback("positive")
+        """
+        if not self._last_skill:
+            return DialogueResponse(
+                message="No recent execution to provide feedback on.",
+                conversation_id=self._conversation.id,
+            )
+        
+        if rating == "negative" and correction:
+            self._conversation.add_message("user", f"Feedback: {correction}")
+            return await self._retry_with_feedback(correction)
+        elif rating == "positive":
+            # Could track success metrics here
+            return DialogueResponse(
+                message="Thanks for the feedback! Skill execution was successful.",
+                skill_used=self._last_skill,
+                conversation_id=self._conversation.id,
+            )
+        else:
+            return DialogueResponse(
+                message="Please provide a correction with negative feedback.",
+                conversation_id=self._conversation.id,
+            )
+    
+    async def save_refined_skill(self) -> bool:
+        """Save the pending refined skill after user confirmation.
+        
+        Returns:
+            True if skill was saved, False if nothing to save.
+        """
+        if hasattr(self, '_refined_skill_pending') and self._refined_skill_pending:
+            await self.storage.save(self._refined_skill_pending)
+            self._refined_skill_pending = None
+            return True
+        return False
     
     async def _prepare_task(self, query: str) -> Task:
         """Prepare a task for skill matching."""
