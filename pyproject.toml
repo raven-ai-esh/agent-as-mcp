@@ -1,6 +1,6 @@
 [project]
 name = "raven-skills"
-version = "0.3.0"
+version = "0.7.2"
 description = "Skill-based agent library for adaptive AI systems"
 requires-python = ">=3.11"
 dependencies = ["openai>=1.0.0", "pydantic>=2.0.0"]
