@@ -60,6 +60,7 @@ class SkillDialogueAgent:
         similarity_threshold: float = 0.55,
         auto_generate_skills: bool = True,
         use_structured_outputs: bool = True,
+        logger: Any | None = None,
     ):
         """Initialize the dialogue agent.
         
@@ -73,11 +74,13 @@ class SkillDialogueAgent:
             similarity_threshold: Minimum score for skill matching.
             auto_generate_skills: Generate new skill if no match found.
             use_structured_outputs: Use structured outputs API.
+            logger: Optional logger for debug output. If None, no logging.
         """
         self.storage = storage
         self.tools = tools or []
         self.similarity_threshold = similarity_threshold
         self.auto_generate_skills = auto_generate_skills
+        self._logger = logger
         
         # Internal clients
         self._client = client
@@ -93,6 +96,14 @@ class SkillDialogueAgent:
         
         # Conversation state
         self._conversation = ConversationState()
+    
+    def _log(self, message: str, level: str = "debug") -> None:
+        """Log message if logger is configured."""
+        if self._logger is None:
+            return
+        
+        log_func = getattr(self._logger, level, self._logger.debug)
+        log_func(message)
         
         # Pending skill execution (for multi-turn clarifications)
         self._pending_skill: Skill | None = None
@@ -227,31 +238,50 @@ class SkillDialogueAgent:
         openai_tools = [tool.to_openai_format() for tool in self.tools]
         sorted_steps = sorted(skill.steps, key=lambda s: s.order)
         
-        # Execute steps starting from pending index
-        for i in range(self._pending_step_index, len(sorted_steps)):
+        # Determine entry point - which step to start from based on context
+        if self._pending_step_index == 0:
+            # Only analyze entry point on fresh execution (not continuation)
+            start_step, satisfied_data = await self._determine_entry_point(
+                skill, sorted_steps, context
+            )
+            # Store data from satisfied steps
+            context.update(satisfied_data)
+        else:
+            start_step = self._pending_step_index
+        
+        # Execute steps starting from entry point
+        for i in range(start_step, len(sorted_steps)):
             step = sorted_steps[i]
             
             # Check if step requires clarification (contains question markers)
             needs_clarification = self._step_needs_clarification(step.instruction)
             
             if needs_clarification and f"step_{i}_input" not in self._collected_inputs:
-                # Ask for clarification
-                clarification_q = await self._generate_clarification(step.instruction, context)
+                # First, check if info is already in context (user's query or conversation)
+                extracted_info = await self._extract_info_from_context(step.instruction, context)
                 
-                # Save state for continuation
-                self._pending_skill = skill
-                self._pending_step_index = i + 1
-                self._pending_task = task
-                
-                self._conversation.add_message("assistant", clarification_q, skill_id=skill.id)
-                
-                return DialogueResponse(
-                    message=clarification_q,
-                    skill_used=skill,
-                    skill_generated=skill_generated,
-                    needs_user_input=True,
-                    conversation_id=self._conversation.id,
-                )
+                if extracted_info:
+                    # Info found in context - use it, don't ask
+                    self._collected_inputs[f"step_{i}_input"] = extracted_info
+                    self._log(f"[SKILL] Step {i+1}: Found info in context: '{extracted_info[:50]}...'")
+                else:
+                    # Info not found - ask for clarification
+                    clarification_q = await self._generate_clarification(step.instruction, context)
+                    
+                    # Save state for continuation
+                    self._pending_skill = skill
+                    self._pending_step_index = i + 1
+                    self._pending_task = task
+                    
+                    self._conversation.add_message("assistant", clarification_q, skill_id=skill.id)
+                    
+                    return DialogueResponse(
+                        message=clarification_q,
+                        skill_used=skill,
+                        skill_generated=skill_generated,
+                        needs_user_input=True,
+                        conversation_id=self._conversation.id,
+                    )
             
             # Execute the step
             step_result, step_tools = await self._execute_step_with_tools(
@@ -305,6 +335,102 @@ class SkillDialogueAgent:
         instruction_lower = instruction.lower()
         return any(marker in instruction_lower for marker in clarification_markers)
     
+    async def _determine_entry_point(
+        self,
+        skill: Skill,
+        steps: list,
+        context: dict,
+    ) -> tuple[int, dict]:
+        """Determine which step to start from based on context.
+        
+        Returns:
+            (start_step_index, satisfied_data): Step index to start from and
+            data extracted from context for satisfied steps.
+        """
+        steps_text = "\n".join(
+            f"Step {i+1}: {s.instruction}" 
+            for i, s in enumerate(steps)
+        )
+        
+        task_query = context.get("task_query", "")
+        conversation = context.get("conversation_history", [])
+        conversation_text = "\n".join(
+            f"{m.get('role', '?')}: {m.get('content', '')}" 
+            for m in conversation[-5:]
+        )
+        
+        response = await self._client.chat.completions.create(
+            model=self._llm.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You analyze skill steps and conversation context to determine "
+                        "which steps are already satisfied.\n\n"
+                        "For each step, determine if the required information/action is "
+                        "already present in the user's query or conversation.\n\n"
+                        "Respond in this exact format:\n"
+                        "STEP 1: SATISFIED|value extracted\n"
+                        "STEP 2: PENDING\n"
+                        "STEP 3: PENDING\n"
+                        "START: 2\n\n"
+                        "The START line indicates which step to begin execution from (1-indexed)."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Skill: {skill.name}\n"
+                        f"Goal: {skill.metadata.goal}\n\n"
+                        f"Steps:\n{steps_text}\n\n"
+                        f"User query: {task_query}\n\n"
+                        f"Conversation:\n{conversation_text}\n\n"
+                        "Analyze which steps are already satisfied:"
+                    )
+                }
+            ],
+            temperature=0,
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        
+        # Parse response
+        satisfied_data = {}
+        start_step = 0  # Default: start from beginning
+        
+        for line in answer.split("\n"):
+            line = line.strip()
+            
+            # Parse START line
+            if line.upper().startswith("START:"):
+                try:
+                    start_step = int(line.split(":")[1].strip()) - 1  # Convert to 0-indexed
+                    start_step = max(0, min(start_step, len(steps) - 1))
+                except:
+                    pass
+            
+            # Parse STEP lines with SATISFIED
+            elif line.upper().startswith("STEP") and "SATISFIED" in line.upper():
+                try:
+                    # Extract step number and value
+                    parts = line.split(":", 1)
+                    step_num = int(parts[0].replace("STEP", "").strip()) - 1
+                    if "|" in parts[1]:
+                        value = parts[1].split("|", 1)[1].strip()
+                        satisfied_data[f"step_{step_num}_result"] = value
+                except:
+                    pass
+        
+        # Log entry point decision
+        self._log(f"[SKILL] Entry point analysis for '{skill.name}':")
+        for i, step in enumerate(steps):
+            status = "SATISFIED" if f"step_{i}_result" in satisfied_data else "PENDING"
+            marker = "✓" if status == "SATISFIED" else "○"
+            self._log(f"[SKILL]   {marker} Step {i+1}: {status}")
+        self._log(f"[SKILL] → Starting from step {start_step + 1}")
+        
+        return start_step, satisfied_data
+    
     async def _generate_clarification(self, instruction: str, context: dict) -> str:
         """Generate a clarification question from step instruction."""
         response = await self._client.chat.completions.create(
@@ -315,6 +441,51 @@ class SkillDialogueAgent:
             ],
         )
         return response.choices[0].message.content
+    
+    async def _extract_info_from_context(self, instruction: str, context: dict) -> str | None:
+        """Try to extract required info from existing context.
+        
+        Returns extracted info if found, None if user needs to be asked.
+        """
+        # Include full conversation history for context
+        conversation_text = ""
+        history = context.get("conversation_history", [])
+        if history:
+            conversation_text = "\n".join(f"{m.get('role', '?')}: {m.get('content', '')}" for m in history[-10:])
+        
+        task_query = context.get("task_query", "")
+        
+        response = await self._client.chat.completions.create(
+            model=self._llm.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an information extractor. Given a step instruction and conversation context, "
+                        "determine if the required information is already provided.\n\n"
+                        "If the info IS in the context, respond with: FOUND: <the extracted info>\n"
+                        "If the info is NOT in the context, respond with: NOT_FOUND"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Step instruction: {instruction}\n\n"
+                        f"User's original query: {task_query}\n\n"
+                        f"Conversation:\n{conversation_text}\n\n"
+                        "Is the required information already in the context?"
+                    )
+                }
+            ],
+            max_tokens=100,
+            temperature=0,
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        
+        if answer.startswith("FOUND:"):
+            return answer[6:].strip()
+        return None
     
     # ─────────────────────────────────────────────────────────────
     # Feedback Mechanism
@@ -377,19 +548,23 @@ class SkillDialogueAgent:
                 action,
             )
             
-            # Build refined skill
+            # Build refined skill - UPDATE existing skill (same ID, increment version)
             from raven_skills.models.skill import SkillMetadata, SkillStep
             
+            # Re-generate embedding for refined skill (better matching in future)
+            new_embedding_text = f"{refined.name}\n{refined.description}\n{refined.goal}"
+            new_embedding = await self._embeddings.embed_text(new_embedding_text)
+            
             refined_skill = Skill(
-                id=f"{self._last_skill.id}-v{self._last_skill.version + 1}",
+                id=self._last_skill.id,  # SAME ID - update in place
                 name=refined.name,
                 version=self._last_skill.version + 1,
-                parent_id=self._last_skill.id,
+                parent_id=self._last_skill.parent_id,  # Keep original parent
                 metadata=SkillMetadata(
                     description=refined.description,
                     goal=refined.goal,
                     keywords=refined.keywords,
-                    embedding=self._last_skill.metadata.embedding,
+                    embedding=new_embedding,  # Updated embedding
                 ),
                 steps=[
                     SkillStep(order=i + 1, instruction=step)
@@ -397,24 +572,28 @@ class SkillDialogueAgent:
                 ],
             )
             
+            # Save updated skill immediately (replaces old version in storage)
+            await self.storage.save(refined_skill)
+            self._log(f"[FEEDBACK] Updated skill '{refined_skill.name}' to v{refined_skill.version}")
+            
             # Execute refined skill
             result = await self._execute_skill_stepwise(
                 refined_skill, self._last_task, skill_generated=False
             )
             
-            # Mark as refined and ask to save
+            # Mark as refined
             result.skill_refined = True
-            result.message += "\n\n💡 Skill was refined. Save updated version? (yes/no)"
+            result.message += "\n\n✅ Skill updated and saved."
             
-            # Store refined skill for potential save
-            self._refined_skill_pending = refined_skill
+            # Clear pending (already saved)
+            self._refined_skill_pending = None
             
             return result
             
         except Exception as e:
             # Log the error for debugging
             import traceback
-            print(f"[FEEDBACK DEBUG] Refinement failed: {e}")
+            self._log(f"[FEEDBACK DEBUG] Refinement failed: {e}")
             traceback.print_exc()
             
             # If refinement fails, just acknowledge and retry with original approach
@@ -482,10 +661,15 @@ class SkillDialogueAgent:
         return False
     
     async def _prepare_task(self, query: str) -> Task:
-        """Prepare a task for skill matching."""
+        """Prepare a task for skill matching with HyDE transformation."""
         aspects = await self._llm.extract_key_aspects(query)
-        embedding_text = f"{query}\n{' '.join(aspects.key_aspects)}"
-        embedding = await self._embeddings.embed_text(embedding_text)
+        
+        # HyDE: Generate hypothetical skill description for the query
+        # This creates a "skill-like" text that matches better with actual skills
+        hypothetical = await self._generate_hypothetical_skill(query, aspects.key_aspects)
+        
+        # Embed the hypothetical skill description (HyDE)
+        embedding = await self._embeddings.embed_text(hypothetical)
         
         return Task(
             id=str(uuid4()),
@@ -496,27 +680,134 @@ class SkillDialogueAgent:
             created_at=datetime.now(),
         )
     
+    async def _generate_hypothetical_skill(self, query: str, aspects: list[str]) -> str:
+        """Generate a hypothetical skill description for HyDE matching.
+        
+        Instead of embedding the query directly, we generate what an ideal
+        matching skill would look like, then embed that. This improves
+        semantic matching with actual skills.
+        """
+        response = await self._client.chat.completions.create(
+            model=self._llm.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate a brief skill description that would solve the user's query. "
+                        "Format:\n"
+                        "Name: [skill name]\n"
+                        "Description: [what the skill does]\n"
+                        "Goal: [expected outcome]\n\n"
+                        "Keep it concise (2-3 sentences max)."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Query: {query}\nKey aspects: {', '.join(aspects)}"
+                }
+            ],
+            max_tokens=150,
+            temperature=0,
+        )
+        
+        hypothetical = response.choices[0].message.content.strip()
+        self._log(f"[HyDE] Generated hypothetical skill:\n{hypothetical[:100]}...")
+        return hypothetical
+    
     async def _match_skill(self, task: Task) -> tuple[Skill | None, float]:
         """Find best matching skill for task."""
         from raven_skills.utils.similarity import cosine_similarity
         
         all_skills = await self.storage.get_all()
         if not all_skills:
+            self._log(f"[MATCH] No skills in storage")
             return None, 0.0
         
         best_skill = None
         best_score = 0.0
+        candidates = []
         
         for skill in all_skills:
-            if skill.metadata.embedding:
-                score = cosine_similarity(task.embedding, skill.metadata.embedding)
+            # Multi-vector matching: take max score across all skill embeddings
+            skill_scores = []
+            
+            # Check multi-vector embeddings first
+            if skill.metadata.embeddings:
+                for emb in skill.metadata.embeddings:
+                    if emb:
+                        skill_scores.append(cosine_similarity(task.embedding, emb))
+            
+            # Fallback to primary embedding
+            if not skill_scores and skill.metadata.embedding:
+                skill_scores.append(cosine_similarity(task.embedding, skill.metadata.embedding))
+            
+            if skill_scores:
+                # Max pooling: best match across all representations
+                score = max(skill_scores)
+                candidates.append((skill, score))
                 if score > best_score:
                     best_score = score
                     best_skill = skill
         
+        # Debug logging
+        self._log(f"[MATCH] Query: '{task.query[:50]}...' | Threshold: {self.similarity_threshold}")
+        for skill, score in sorted(candidates, key=lambda x: -x[1])[:5]:
+            marker = "✓" if score >= self.similarity_threshold else ("?" if score >= 0.35 else "✗")
+            self._log(f"[MATCH]   {marker} {skill.name}: {score:.3f}")
+        
+        # Direct match - high confidence
         if best_score >= self.similarity_threshold:
+            self._log(f"[MATCH] → Selected: '{best_skill.name}' ({best_score:.3f})")
             return best_skill, best_score
+        
+        # Gray zone (0.35 - threshold) - ask LLM to verify
+        gray_zone_min = 0.35
+        if best_score >= gray_zone_min and best_skill:
+            self._log(f"[MATCH] Gray zone ({best_score:.3f}) - asking LLM to verify...")
+            is_match = await self._llm_verify_match(task, best_skill)
+            if is_match:
+                self._log(f"[MATCH] → LLM confirmed: '{best_skill.name}'")
+                return best_skill, best_score
+            else:
+                self._log(f"[MATCH] → LLM rejected match")
+        
+        self._log(f"[MATCH] → No match (best: {best_score:.3f})")
         return None, best_score
+    
+    async def _llm_verify_match(self, task: Task, skill: Skill) -> bool:
+        """Ask LLM to verify if skill matches the task."""
+        steps_text = "\n".join(f"- {s.instruction}" for s in skill.steps[:5])
+        
+        response = await self._client.chat.completions.create(
+            model=self._llm.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a skill matching validator. "
+                        "Determine if the given skill can solve the user's task. "
+                        "Respond with only 'YES' or 'NO'."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User task: {task.query}\n\n"
+                        f"Skill: {skill.name}\n"
+                        f"Description: {skill.metadata.description}\n"
+                        f"Goal: {skill.metadata.goal}\n"
+                        f"Steps:\n{steps_text}\n\n"
+                        "Can this skill solve the user's task? YES or NO:"
+                    )
+                }
+            ],
+            max_tokens=10,
+            temperature=0,
+        )
+        
+        answer = response.choices[0].message.content.strip().upper()
+        self._log(f"[MATCH] LLM verification: '{answer}'")
+        return "YES" in answer
     
     async def _generate_skill_from_request(
         self, task: Task, message: str
@@ -538,11 +829,25 @@ class SkillDialogueAgent:
             # Build skill from schema response
             from raven_skills.models.skill import SkillMetadata, SkillStep
             
+            # Generate multi-vector embeddings for improved matching
+            embedding_texts = [
+                skill_data.name,                           # Embed name separately
+                skill_data.description,                    # Embed description  
+                skill_data.goal,                           # Embed goal
+                " ".join(skill_data.keywords),             # Embed keywords
+            ]
+            multi_embeddings = await self._embeddings.embed_texts(embedding_texts)
+            
+            # Primary embedding (combined) for backward compatibility
+            primary_text = f"{skill_data.name}\n{skill_data.description}\n{skill_data.goal}"
+            primary_embedding = await self._embeddings.embed_text(primary_text)
+            
             metadata = SkillMetadata(
                 description=skill_data.description,
                 goal=skill_data.goal,
                 keywords=skill_data.keywords,
-                embedding=task.embedding,
+                embedding=primary_embedding,      # Primary (legacy)
+                embeddings=multi_embeddings,      # Multi-vector
             )
             
             steps = [
@@ -560,10 +865,11 @@ class SkillDialogueAgent:
             )
             
             await self.storage.save(skill)
+            self._log(f"[SKILL] Created new skill: '{skill.name}' ({len(skill.steps)} steps)")
             return skill
         except Exception as e:
             import traceback
-            print(f"⚠️ Skill generation failed: {e}")
+            self._log(f"⚠️ Skill generation failed: {e}")
             traceback.print_exc()
             return None
     

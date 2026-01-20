@@ -13,12 +13,14 @@ class SkillMetadata:
         description: Human-readable description of what the skill does.
         goal: Expected outcome/result when the skill is executed successfully.
         keywords: Key terms describing the main stages/aspects of the skill.
-        embedding: Computed embedding vector for similarity matching.
+        embedding: Primary embedding vector for similarity matching (legacy).
+        embeddings: Multi-vector embeddings for improved matching.
     """
     description: str
     goal: str
     keywords: list[str] = field(default_factory=list)
-    embedding: list[float] = field(default_factory=list)
+    embedding: list[float] = field(default_factory=list)  # Primary/legacy
+    embeddings: list[list[float]] = field(default_factory=list)  # Multi-vector
 
     def to_embedding_text(self) -> str:
         """Generate text representation for embedding computation."""

@@ -66,6 +66,7 @@ class JSONStorage(SkillStorage):
                 "goal": skill.metadata.goal,
                 "keywords": skill.metadata.keywords,
                 "embedding": skill.metadata.embedding,
+                "embeddings": skill.metadata.embeddings,  # Multi-vector
             },
             "steps": [
                 {
@@ -89,7 +90,8 @@ class JSONStorage(SkillStorage):
                 description=data["metadata"]["description"],
                 goal=data["metadata"]["goal"],
                 keywords=data["metadata"].get("keywords", []),
-                embedding=data["metadata"].get("embedding"),
+                embedding=data["metadata"].get("embedding", []),
+                embeddings=data["metadata"].get("embeddings", []),  # Multi-vector
             ),
             steps=[
                 SkillStep(

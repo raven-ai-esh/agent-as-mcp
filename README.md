@@ -26,41 +26,42 @@ The library is designed to be simple. You only need an OpenAI client and a skill
 ```python
 import asyncio
 from openai import AsyncOpenAI
-from raven_skills import SkillAgent, InMemoryStorage
+from raven_skills import SkillDialogueAgent, Tool, JSONStorage
+
+# Define a tool (optional)
+def get_weather(city: str) -> str:
+    return f"Weather in {city}: sunny, 22°C"
+
+weather_tool = Tool(
+    name="get_weather",
+    description="Get weather forecast for a city",
+    parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+    function=get_weather,
+)
 
 async def main():
     # 1. Initialize
-    agent = SkillAgent(
+    agent = SkillDialogueAgent(
         client=AsyncOpenAI(),
-        storage=InMemoryStorage(),
-        llm_model="gpt-4o-mini",
+        storage=JSONStorage("./skills.json"),
+        tools=[weather_tool],
+        auto_generate_skills=True,
     )
 
-    # 2. Match a skill
-    task, result = await agent.match("How to deploy an application?")
-
-    if result.found:
-        print(f"Found skill: {result.skill.name}")
-        
-        # 3. Execute the skill
-        execution = await agent.execute(result.skill, task)
-        print(f"Result: {execution.output}")
-        
-    else:
-        print("No skill found, switching to dialogue mode...")
-        # Here you handle the conversation yourself
-        conversation_log = [
-            {"role": "user", "content": "How to deploy?"},
-            {"role": "assistant", "content": "First, build the image..."},
-        ]
-        
-        # 4. Save experience as a new skill
-        new_skill = await agent.generate_skill(
-            task=task,
-            conversation=conversation_log,
-            final_result="Application deployed",
-        )
-        print(f"Created new skill: {new_skill.name}")
+    # 2. Chat with the agent
+    response = await agent.chat("What's the weather in Moscow?")
+    print(response.message)
+    # → "It's sunny in Moscow, 22°C"
+    # Agent created skill "Get Weather Forecast" and saved it
+    
+    # 3. If something goes wrong, provide feedback
+    response = await agent.chat("No, that's wrong - I asked about Paris")
+    print(response.message)
+    # → Agent detects negative feedback, refines skill, retries
+    
+    # 4. Save refined skill if needed
+    if response.skill_refined:
+        await agent.save_refined_skill()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -78,7 +79,7 @@ No need to write your own prompts or parsers.
 
 ## Skill Storage
 
-Skills are stored using the `SkillStorage` interface. The library includes `InMemoryStorage` for testing, but for production you can implement your own (e.g., Postgres + pgvector).
+Skills are stored using the `SkillStorage` interface. The library includes `JSONStorage` for file-based persistence. For production, you can implement your own (e.g., Postgres + pgvector).
 
 ### Custom Storage Implementation
 
@@ -116,13 +117,28 @@ class PostgresStorage(SkillStorage):
 
 ### Diagnosis and Self-Correction
 
-If a skill performs poorly, the agent can diagnose the problem and suggest a fix.
+**With SkillDialogueAgent** (recommended): just provide negative feedback in the conversation:
 
 ```python
-# Assume execution failed or user is unhappy
+# The agent automatically diagnoses and refines
+response = await agent.chat("That's wrong, step 2 has an auth error")
+# Agent: diagnoses → refines skill → retries automatically
+
+if response.skill_refined:
+    await agent.save_refined_skill()
+```
+
+**With SkillAgent** (low-level): manual diagnosis and refinement:
+
+```python
+from raven_skills import SkillAgent
+
+agent = SkillAgent(client=AsyncOpenAI(), storage=storage)
+
+# Execute skill
 execution = await agent.execute(skill, task)
 
-# Diagnose
+# Diagnose issue
 action = await agent.diagnose(
     skill=skill,
     task=task,
@@ -131,7 +147,7 @@ action = await agent.diagnose(
 )
 
 print(f"Diagnosis: {action.diagnosis}")
-# e.g.: "wrong_steps" -> "Error in skill steps"
+# e.g.: "wrong_steps" → "Error in skill steps"
 
 # Refine (creates new version of skill)
 refined_skill = await agent.refine(skill, action)
@@ -139,11 +155,19 @@ refined_skill = await agent.refine(skill, action)
 
 ### Merging and Optimization
 
-Over time, duplicate skills may appear. The agent can find and merge them.
+Over time, duplicate skills may appear. Use `SkillAgent` for optimization tasks:
 
 ```python
+from raven_skills import SkillAgent, JSONStorage
+from openai import AsyncOpenAI
+
+# SkillAgent provides low-level skill operations including optimization
+agent = SkillAgent(
+    client=AsyncOpenAI(),
+    storage=JSONStorage("./skills.json"),
+)
+
 # Find similar skills and merge them
-# (dry_run=False to apply changes)
 results = await agent.optimize(similarity_threshold=0.95, dry_run=False)
 
 for originals, merged in results:
